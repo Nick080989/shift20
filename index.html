@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SHIFT/20</title>
+<style>
+  html, body { margin:0; height:100%; background:#0b0b12; overflow:hidden; touch-action:none; -webkit-user-select:none; user-select:none; }
+  canvas { display:block; width:100%; height:100%; }
+</style>
+</head>
+<body>
+<canvas id="c" aria-label="SHIFT/20 game"></canvas>
+<script>
+// SHIFT/20 — one key, two worlds, twenty seconds.
+const cv = document.getElementById('c'), cx = cv.getContext('2d');
+const BPM = 156, BEAT = 60 / BPM, LENGTH = 20;
+const store = { get(k, d) { try { const v = localStorage.getItem('shift20:' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+                set(k, v) { try { localStorage.setItem('shift20:' + k, JSON.stringify(v)); } catch (e) {} } };
+
+// ---------- audio (Web Audio, files from Pocket Arcade SFX + Music) ----------
+const A = { ctx: null, buf: {}, music: null, gain: null,
+  async init() {
+    if (this.ctx) return; try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return; }
+    this.gain = this.ctx.createGain(); this.gain.gain.value = 0.9; this.gain.connect(this.ctx.destination);
+    await Promise.all(['shift', 'coin', 'crash', 'hit', 'end', 'start', 'combo', 'music'].map(async n => {
+      try { const r = await fetch('audio/' + n + '.ogg'); this.buf[n] = await this.ctx.decodeAudioData(await r.arrayBuffer()); } catch (e) {}
+    }));
+  },
+  play(n, vol = 1, rate = 1) { if (!this.ctx || !this.buf[n]) return; const s = this.ctx.createBufferSource(); s.buffer = this.buf[n]; s.playbackRate.value = rate;
+    const g = this.ctx.createGain(); g.gain.value = vol; s.connect(g); g.connect(this.gain); s.start(); return s; },
+  startMusic() { this.stopMusic(); if (!this.buf.music) return; const s = this.ctx.createBufferSource(); s.buffer = this.buf.music; s.loop = true;
+    const g = this.ctx.createGain(); g.gain.value = 0.55; s.connect(g); g.connect(this.gain); s.start(); this.music = { s, g }; },
+  stopMusic(fade = 0.4) { if (!this.music) return; const { s, g } = this.music; const t = this.ctx.currentTime; g.gain.setValueAtTime(g.gain.value, t); g.gain.linearRampToValueAtTime(0, t + fade); s.stop(t + fade + 0.05); this.music = null; }
+};
+
+// ---------- state ----------
+let W = 0, H = 0, S = 1;
+function resize() { const d = Math.min(devicePixelRatio || 1, 2); cv.width = innerWidth * d; cv.height = innerHeight * d; cx.setTransform(d, 0, 0, d, 0, 0); W = innerWidth; H = innerHeight; S = Math.min(W / 960, H / 540); }
+addEventListener('resize', resize); resize();
+
+let mode = 'title', dim = 0, t0 = 0, now = 0, objs = [], parts = [], score = 0, combo = 0, bestCombo = 0, hits = 0, coins = 0;
+let shake = 0, flash = 0, flipAnim = 0, nextBeat = 0, best = store.get('best', 0), lastEnd = 0, rng = 1;
+const rand = () => (rng = (rng * 16807) % 2147483647) / 2147483647;
+const speed = () => (520 + 260 * Math.min(1, (now - t0) / LENGTH)) * S; // px per second
+const playerX = () => W * 0.26;
+
+function start() {
+  mode = 'play'; dim = 0; objs = []; parts = []; score = 0; combo = 0; bestCombo = 0; hits = 0; coins = 0;
+  t0 = now; nextBeat = 0; rng = (Date.now() % 100000) + 7; flash = 0.6;
+  A.play('start', 0.8); A.startMusic();
+}
+function shift() {
+  if (mode !== 'play') return;
+  dim ^= 1; flipAnim = 1; A.play('shift', 0.45, 1.3);
+  for (let i = 0; i < 10; i++) parts.push({ x: playerX(), y: H / 2, vx: (rand() - 0.5) * 300, vy: (rand() - 0.5) * 300, life: 0.4, c: dim ? '#7ee0c3' : '#ff5c8a' });
+}
+function press(e) {
+  A.init();
+  if (e && e.type === 'keydown' && !['ShiftLeft', 'ShiftRight', 'Space', 'Enter'].includes(e.code)) return;
+  if (e) e.preventDefault();
+  if (mode === 'title' || (mode === 'end' && now - lastEnd > 0.8)) { A.init().then(start); return; }
+  shift();
+}
+addEventListener('keydown', e => { if (!e.repeat) press(e); });
+cv.addEventListener('pointerdown', press);
+
+// pattern: one object per beat (sometimes a rest); walls force you out of their world, coins reward being in theirs
+function spawn(beatIndex) {
+  const x = W + 40 * S, r = rand();
+  if (beatIndex < 3) return;                                    // a breath before the first object
+  if (r < 0.12) return;                                         // rest
+  const d = rand() < 0.5 ? 0 : 1;
+  if (r < 0.62) objs.push({ kind: 'wall', d, x, hit: false });
+  else objs.push({ kind: 'coin', d, x, got: false });
+  if (beatIndex > 20 && rand() < 0.35)                          // late game: a coin right behind a wall of the other world
+    objs.push({ kind: 'coin', d: 1 - d, x: x + speed() * BEAT * 0.5, got: false });
+}
+
+function update(dt) {
+  now += dt; shake = Math.max(0, shake - dt * 3); flash = Math.max(0, flash - dt * 2.5); flipAnim = Math.max(0, flipAnim - dt * 6);
+  parts = parts.filter(p => (p.life -= dt) > 0); parts.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; });
+  if (mode !== 'play') return;
+  const el = now - t0;
+  while (nextBeat * BEAT <= el + 0.0001) { spawn(nextBeat); nextBeat++; }
+  const v = speed(), px = playerX(), half = 22 * S;
+  for (const o of objs) {
+    o.x -= v * dt;
+    const near = Math.abs(o.x - px) < half + (o.kind === 'wall' ? 10 * S : 14 * S);
+    if (o.kind === 'wall' && near && !o.hit && o.d === dim) {
+      o.hit = true; hits++; combo = 0; score = Math.max(0, score - 50); shake = 0.6; flash = 0.35; A.play('hit', 0.9);
+      for (let i = 0; i < 16; i++) parts.push({ x: px, y: H / 2, vx: (rand() - 0.2) * -500, vy: (rand() - 0.5) * 500, life: 0.6, c: '#ff3b3b' });
+    }
+    if (o.kind === 'wall' && !o.hit && !o.passed && o.x < px - half) { o.passed = true; score += 10; }
+    if (o.kind === 'coin' && near && !o.got && o.d === dim) {
+      o.got = true; coins++; combo++; bestCombo = Math.max(bestCombo, combo);
+      const gain = 25 * Math.min(8, combo); score += gain;
+      A.play(combo % 5 === 0 ? 'combo' : 'coin', 0.55, 1 + Math.min(0.5, combo * 0.03));
+      for (let i = 0; i < 12; i++) parts.push({ x: o.x, y: H / 2, vx: (rand() - 0.5) * 420, vy: (rand() - 0.5) * 420, life: 0.5, c: '#ffcc4d' });
+      o.label = '+' + gain; o.lt = 0.6;
+    }
+    if (o.lt) o.lt -= dt;
+  }
+  objs = objs.filter(o => o.x > -80 * S);
+  if (el >= LENGTH) finish();
+}
+function finish() {
+  mode = 'end'; lastEnd = now; A.stopMusic(0.6); A.play('end', 0.8);
+  if (score > best) { best = score; store.set('best', best); }
+}
+function grade() { return score >= 3800 ? 'S' : score >= 2800 ? 'A' : score >= 1800 ? 'B' : score >= 900 ? 'C' : 'D'; }
+
+// ---------- drawing ----------
+const PAL = [{ bg: '#f4f1ea', fg: '#14121f', acc: '#ff5c8a', other: '#7ee0c3' }, { bg: '#100e1a', fg: '#f2eefc', acc: '#7ee0c3', other: '#ff5c8a' }];
+function draw() {
+  const p = PAL[dim]; const sx = (Math.random() - 0.5) * 18 * shake * S, sy = (Math.random() - 0.5) * 18 * shake * S;
+  cx.save(); cx.translate(sx, sy);
+  cx.fillStyle = p.bg; cx.fillRect(-20, -20, W + 40, H + 40);
+  // flip wipe
+  if (flipAnim > 0) { cx.fillStyle = PAL[1 - dim].bg; const r = (1 - flipAnim) * Math.hypot(W, H); cx.beginPath(); cx.rect(0, 0, W, H); cx.arc(playerX(), H / 2, r, 0, Math.PI * 2, true); cx.fill(); }
+  // track lines
+  const el = mode === 'play' ? now - t0 : 0, off = (el * speed()) % (80 * S);
+  cx.strokeStyle = p.fg; cx.globalAlpha = 0.12; cx.lineWidth = 2;
+  for (let x = -off; x < W; x += 80 * S) { cx.beginPath(); cx.moveTo(x, H / 2 + 60 * S); cx.lineTo(x + 40 * S, H / 2 + 60 * S); cx.stroke(); cx.beginPath(); cx.moveTo(x, H / 2 - 60 * S); cx.lineTo(x + 40 * S, H / 2 - 60 * S); cx.stroke(); }
+  cx.globalAlpha = 1;
+  // objects
+  for (const o of objs) {
+    const solid = o.d === dim, col = o.d === 0 ? '#ff5c8a' : '#7ee0c3';
+    if (o.kind === 'wall') {
+      const w = 22 * S, h = 120 * S;
+      if (solid && !o.hit) { cx.fillStyle = col; cx.fillRect(o.x - w / 2, H / 2 - h / 2, w, h); cx.fillStyle = p.fg; cx.globalAlpha = .25; cx.fillRect(o.x - w / 2, H / 2 - h / 2, w, 6 * S); cx.globalAlpha = 1; }
+      else { cx.setLineDash([6 * S, 6 * S]); cx.strokeStyle = col; cx.globalAlpha = o.hit ? .2 : .55; cx.lineWidth = 2; cx.strokeRect(o.x - w / 2, H / 2 - h / 2, w, h); cx.setLineDash([]); cx.globalAlpha = 1; }
+    } else if (!o.got) {
+      const r = 11 * S, pulse = 1 + 0.12 * Math.sin(now * 12 + o.x * 0.05);
+      cx.beginPath(); cx.arc(o.x, H / 2, r * pulse, 0, Math.PI * 2);
+      if (solid) { cx.fillStyle = '#ffcc4d'; cx.fill(); cx.strokeStyle = col; cx.lineWidth = 3; cx.stroke(); }
+      else { cx.strokeStyle = '#ffcc4d'; cx.globalAlpha = .45; cx.lineWidth = 2; cx.stroke(); cx.globalAlpha = 1; }
+    }
+    if (o.label && o.lt > 0) { cx.fillStyle = '#ffcc4d'; cx.font = `bold ${18 * S}px monospace`; cx.textAlign = 'center'; cx.fillText(o.label, o.x, H / 2 - 40 * S - (0.6 - o.lt) * 60 * S); }
+  }
+  // player
+  const px = playerX(), s = 22 * S * (1 + flipAnim * 0.4);
+  cx.save(); cx.translate(px, H / 2); cx.rotate(flipAnim * Math.PI / 2);
+  cx.fillStyle = p.acc; cx.fillRect(-s, -s, 2 * s, 2 * s); cx.fillStyle = p.bg; cx.fillRect(-s * 0.35, -s * 0.35, s * 0.7, s * 0.7);
+  cx.restore();
+  // particles
+  for (const q of parts) { cx.globalAlpha = Math.max(0, q.life * 2); cx.fillStyle = q.c; cx.fillRect(q.x - 3 * S, q.y - 3 * S, 6 * S, 6 * S); }
+  cx.globalAlpha = 1;
+  if (flash > 0) { cx.fillStyle = '#ffffff'; cx.globalAlpha = flash * 0.5; cx.fillRect(-20, -20, W + 40, H + 40); cx.globalAlpha = 1; }
+  cx.restore();
+  hud(p);
+}
+function txt(s, x, y, size, col, align = 'center', weight = 'bold') { cx.fillStyle = col; cx.font = `${weight} ${size * S}px "Courier New", monospace`; cx.textAlign = align; cx.textBaseline = 'middle'; cx.fillText(s, x, y); }
+function hud(p) {
+  if (mode === 'play') {
+    const left = Math.max(0, LENGTH - (now - t0));
+    txt(left.toFixed(1), W / 2, 44 * S, 40, p.fg);
+    cx.fillStyle = p.fg; cx.globalAlpha = 0.15; cx.fillRect(W * 0.2, 74 * S, W * 0.6, 6 * S); cx.globalAlpha = 1;
+    cx.fillStyle = p.acc; cx.fillRect(W * 0.2, 74 * S, W * 0.6 * (left / LENGTH), 6 * S);
+    txt('SCORE ' + score, 24 * S, 34 * S, 20, p.fg, 'left');
+    if (combo > 1) txt('x' + Math.min(8, combo) + ' COMBO', 24 * S, 62 * S, 18, '#ffcc4d', 'left');
+    txt(dim ? 'WORLD B' : 'WORLD A', W - 24 * S, 34 * S, 18, p.acc, 'right');
+  } else if (mode === 'title') {
+    txt('SHIFT/20', W / 2, H * 0.27, 78, p.fg);
+    txt('One key. Two worlds. Twenty seconds.', W / 2, H * 0.27 + 62 * S, 20, p.acc, 'center', 'normal');
+    const lines = ['Solid walls hit you. Outlined ones are in the other world.', 'Press SHIFT (or tap) to swap worlds.', 'Grab coins in your world, chain them for combos.'];
+    lines.forEach((l, i) => txt(l, W / 2, H * 0.68 + i * 30 * S, 17, p.fg, 'center', 'normal'));
+    if (Math.floor(now * 2) % 2 === 0) txt('PRESS SHIFT / TAP TO START', W / 2, H * 0.68 + 112 * S, 22, p.acc);
+    txt('sound + music: Pocket Arcade SFX & Music · made with AI assistance', W / 2, H - 22 * S, 13, p.fg, 'center', 'normal');
+    if (best) txt('BEST ' + best, W - 24 * S, 34 * S, 16, p.fg, 'right');
+  } else {
+    cx.fillStyle = p.bg; cx.globalAlpha = 0.82; cx.fillRect(0, 0, W, H); cx.globalAlpha = 1;
+    txt('TIME!', W / 2, H * 0.2, 56, p.fg);
+    txt(grade(), W / 2, H * 0.42, 120, p.acc);
+    txt(`SCORE ${score}   ·   BEST ${best}`, W / 2, H * 0.62, 24, p.fg);
+    txt(`coins ${coins}   ·   best combo ${bestCombo}   ·   hits ${hits}`, W / 2, H * 0.62 + 36 * S, 17, p.fg, 'center', 'normal');
+    if (now - lastEnd > 0.8 && Math.floor(now * 2) % 2 === 0) txt('SHIFT AGAIN?', W / 2, H * 0.84, 24, p.acc);
+  }
+}
+
+let last = performance.now();
+function loop(t) { const dt = Math.min(0.05, (t - last) / 1000); last = t; update(dt); draw(); requestAnimationFrame(loop); }
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
